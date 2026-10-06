@@ -101,5 +101,45 @@ Reading the numbers:
 - MinIO and Spark share one host and one disk, so network and storage latency of a real object store are not represented.
 - The actual row-group count in the file was not inspected; it is assumed from `parquet.block.size=64MB`.
 
+## Source code references
+
+Spark `v3.5.3` (the image used here) and parquet-mr `1.13.1` (the Parquet version Spark 3.5.3 depends on). Links are line-pinned permalinks.
+
+Read path, in the order it executes:
+
+1. **Split size.** [`FilePartition.maxSplitBytes`](https://github.com/apache/spark/blob/v3.5.3/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/FilePartition.scala#L109-L120):
+   ```scala
+   val totalBytes = selectedPartitions.flatMap(_.files.map(_.getLen + openCostInBytes)).sum
+   val bytesPerCore = totalBytes / minPartitionNum          // defaults to leafNodeDefaultParallelism
+   Math.min(defaultMaxSplitBytes, Math.max(openCostInBytes, bytesPerCore))
+   ```
+   `minPartitionNum` falls back to `leafNodeDefaultParallelism`, which defaults to `SparkContext#defaultParallelism` ([`SQLConf` L616-L622](https://github.com/apache/spark/blob/v3.5.3/sql/catalyst/src/main/scala/org/apache/spark/sql/internal/SQLConf.scala#L616-L622)). Defaults: `maxPartitionBytes` 128MB ([L1753-L1759](https://github.com/apache/spark/blob/v3.5.3/sql/catalyst/src/main/scala/org/apache/spark/sql/internal/SQLConf.scala#L1753-L1759)), `openCostInBytes` 4MB ([L1761-L1770](https://github.com/apache/spark/blob/v3.5.3/sql/catalyst/src/main/scala/org/apache/spark/sql/internal/SQLConf.scala#L1761-L1770)).
+2. **Parquet is always splittable.** [`ParquetFileFormat.isSplitable`](https://github.com/apache/spark/blob/v3.5.3/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/parquet/ParquetFileFormat.scala#L103-L108) returns `true` unconditionally (it does not depend on the codec, unlike gzip text).
+3. **File to byte ranges.** [`PartitionedFileUtil.splitFiles`](https://github.com/apache/spark/blob/v3.5.3/sql/core/src/main/scala/org/apache/spark/sql/execution/PartitionedFileUtil.scala#L28-L45) cuts a file into `[offset, offset + maxSplitBytes)` ranges: `(0L until file.getLen by maxSplitBytes)`. It cuts at arbitrary byte offsets, not row-group boundaries.
+4. **Ranges to tasks.** [`FileSourceScanExec` L675-L709](https://github.com/apache/spark/blob/v3.5.3/sql/core/src/main/scala/org/apache/spark/sql/execution/DataSourceScanExec.scala#L675-L709) sorts splits by size descending and calls [`FilePartition.getFilePartitions`](https://github.com/apache/spark/blob/v3.5.3/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/FilePartition.scala#L55-L85), which bin-packs ranges greedily (`if (currentSize + file.length > maxSplitBytes) closePartition()`, then `currentSize += file.length + openCostInBytes`). Each resulting `FilePartition` is one `FileScanRDD` partition, i.e. one task.
+5. **Byte range to row groups.** The task's range is turned into a footer filter: [`ParquetFooterReader.readFooter` L52-L66](https://github.com/apache/spark/blob/v3.5.3/sql/core/src/main/java/org/apache/spark/sql/execution/datasources/parquet/ParquetFooterReader.java#L52-L66) uses `.withRange(fileStart, fileStart + file.length())` (the non-vectorized reader does the same in [`SpecificParquetRecordReaderBase` L109](https://github.com/apache/spark/blob/v3.5.3/sql/core/src/main/java/org/apache/spark/sql/execution/datasources/parquet/SpecificParquetRecordReaderBase.java#L109)). parquet-mr then keeps a row group only if its midpoint lies in the range: [`ParquetMetadataConverter.filterFileMetaDataByMidpoint`](https://github.com/apache/parquet-mr/blob/apache-parquet-1.13.1/parquet-hadoop/src/main/java/org/apache/parquet/format/converter/ParquetMetadataConverter.java#L1244-L1293):
+   ```java
+   long midPoint = startIndex + totalSize / 2;
+   if (filter.contains(midPoint)) { newRowGroups.add(rowGroup); }
+   ```
+   Every row group has exactly one midpoint, so it is read by exactly one task: no row group is read twice, none is skipped, and a row group is never split across tasks.
+6. **Column pruning.** [`ParquetReadSupport.clipParquetSchema` (call at L153)](https://github.com/apache/spark/blob/v3.5.3/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/parquet/ParquetReadSupport.scala#L150-L156) clips the file schema to the requested columns, so the Parquet reader only fetches those column chunks. This is why `input` was about 13% of the file for 5 of 30 columns.
+
+### Checking the formulas against the test results
+
+`defaultParallelism` = 8 (`total_task_slots=8` in the output).
+
+| Test | `totalBytes` | `bytesPerCore` | `maxSplitBytes` | Expected tasks | Observed tasks |
+|---|---|---|---|---|---|
+| 1: 8 files x 44.5 MB | 8 x (44.5 + 4) = 388 MB | 48.5 MB | min(128, 48.5) = 48.5 MB | 8 (a second 44.5 MB file does not fit: 48.5 + 44.5 > 48.5, so one file per partition) | 8 |
+| 2: 1 file x 2134.7 MB | 2134.7 + 4 = 2138.7 MB | 267.3 MB | min(128, 267.3) = 128 MB | ceil(2134.7 / 128) = 17 | 17 |
+
+Consequences for tuning:
+- A single file is parallelizable only if `size / maxSplitBytes > 1` and it contains more than one row group. If a split's range contains no row-group midpoint, its task reads nothing.
+- With few cores or small data, `bytesPerCore` (not `MAX_PARTITION_MB`) becomes the effective split size, so shrinking the cluster can reduce the task count.
+- Row groups larger than `maxSplitBytes` give some tasks zero row groups and others one, so tasks are uneven.
+
+Not covered by this lab: the vectorized reader (`spark.sql.parquet.enableVectorizedReader`, default true) uses the same range-to-row-group mapping through `ParquetFooterReader`; per-column-chunk I/O in parquet-mr (`ParquetFileReader`, S3A seek/read-ahead) was not traced.
+
 ## Notes
 - Docker VM disk exhaustion caused JVM SIGBUS crashes during development; keep free space available for the generated data and the `ivy` volume.
