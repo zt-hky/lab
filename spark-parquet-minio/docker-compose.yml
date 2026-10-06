@@ -21,7 +21,6 @@ x-spark-conf: &spark-conf >-
 x-spark-base: &spark-base
   image: ${SPARK_IMAGE}
   user: root
-  env_file: .env
 
 x-spark-job: &spark-job
   <<: *spark-base
@@ -29,8 +28,18 @@ x-spark-job: &spark-job
   depends_on:
     minio-init: {condition: service_completed_successfully}
     spark-master: {condition: service_started}
+  # Interpolated from the shell first, then .env, so `VAR=x make read` overrides .env.
   environment:
     SPARK_CONF: *spark-conf
+    BUCKET: ${BUCKET}
+    DATA_PATH: ${DATA_PATH}
+    TOTAL_COLUMNS: ${TOTAL_COLUMNS}
+    NUM_FILES: ${NUM_FILES}
+    ROWS_PER_FILE: ${ROWS_PER_FILE}
+    ROW_GROUP_SIZE_MB: ${ROW_GROUP_SIZE_MB}
+    COMPRESSION: ${COMPRESSION}
+    READ_COLUMNS: ${READ_COLUMNS}
+    HOLD_SECONDS: ${HOLD_SECONDS}
   ports: ["4040:4040"]
   volumes:
     - ./jobs:/jobs:ro
