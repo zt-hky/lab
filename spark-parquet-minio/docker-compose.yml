@@ -1,0 +1,110 @@
+# Không build image nào: chỉ dùng apache/spark + minio/minio + minio/mc.
+x-spark-conf: &spark-conf >-
+  --conf spark.jars.packages=org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262
+  --conf spark.jars.ivy=/ivy
+  --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000
+  --conf spark.hadoop.fs.s3a.access.key=${MINIO_USER}
+  --conf spark.hadoop.fs.s3a.secret.key=${MINIO_PASSWORD}
+  --conf spark.hadoop.fs.s3a.path.style.access=true
+  --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false
+  --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+  --conf spark.hadoop.mapreduce.fileoutputcommitter.algorithm.version=2
+  --conf spark.eventLog.enabled=true
+  --conf spark.eventLog.dir=file:///spark-events
+  --conf spark.master=spark://spark-master:7077
+  --conf spark.driver.memory=${DRIVER_MEMORY}
+  --conf spark.driver.bindAddress=0.0.0.0
+  --conf spark.executor.cores=${EXECUTOR_CORES}
+  --conf spark.executor.memory=${EXECUTOR_MEMORY}
+  --conf spark.cores.max=$$((${NUM_EXECUTORS} * ${EXECUTOR_CORES}))
+
+x-spark-base: &spark-base
+  image: ${SPARK_IMAGE}
+  user: root
+  env_file: .env
+
+x-spark-job: &spark-job
+  <<: *spark-base
+  profiles: [job]
+  depends_on:
+    minio-init: {condition: service_completed_successfully}
+    spark-master: {condition: service_started}
+  environment:
+    SPARK_CONF: *spark-conf
+  ports: ["4040:4040"]
+  volumes:
+    - ./jobs:/jobs:ro
+    - spark-events:/spark-events
+    - ivy:/ivy
+
+services:
+  minio:
+    image: ${MINIO_IMAGE}
+    user: root
+    entrypoint: ["/opt/bitnami/minio/bin/minio"]
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD}
+    ports: ["9000:9000", "9001:9001"]
+    volumes: [minio-data:/data]
+    healthcheck:
+      test: ["CMD", "/opt/bitnami/minio-client/bin/mc", "ready", "local"]
+      interval: 3s
+      retries: 20
+
+  minio-init:
+    image: ${MINIO_IMAGE}
+    depends_on:
+      minio: {condition: service_healthy}
+    entrypoint: >
+      /bin/bash -c "MC=/opt/bitnami/minio-client/bin/mc;
+      $$MC alias set l http://minio:9000 ${MINIO_USER} ${MINIO_PASSWORD} &&
+      $$MC mb --ignore-existing l/${BUCKET}"
+
+  spark-master:
+    <<: *spark-base
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master --host spark-master
+    ports: ["8080:8080", "7077:7077"]
+
+  spark-worker:
+    <<: *spark-base
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077 --cores ${WORKER_CORES} --memory ${WORKER_MEMORY}
+    depends_on: [spark-master]
+    deploy:
+      replicas: ${WORKER_REPLICAS}
+    # không publish port: worker UI xem qua master :8080
+
+  spark-history:
+    <<: *spark-base
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.history.HistoryServer
+    environment:
+      SPARK_HISTORY_OPTS: -Dspark.history.fs.logDirectory=file:///spark-events -Dspark.history.fs.update.interval=3s
+    ports: ["18080:18080"]
+    volumes: [spark-events:/spark-events]
+
+  gen:
+    <<: *spark-job
+    hostname: gen
+    command: >
+      /bin/bash -c "eval /opt/spark/bin/spark-submit $$SPARK_CONF
+      --conf spark.driver.host=gen
+      --conf spark.hadoop.parquet.block.size=$$((${ROW_GROUP_SIZE_MB} * 1024 * 1024))
+      --conf spark.hadoop.parquet.page.size=$$((${PAGE_SIZE_KB} * 1024))
+      --conf spark.sql.parquet.compression.codec=${COMPRESSION}
+      /jobs/gen.py"
+
+  read:
+    <<: *spark-job
+    hostname: read
+    command: >
+      /bin/bash -c "eval /opt/spark/bin/spark-submit $$SPARK_CONF
+      --conf spark.driver.host=read
+      --conf spark.sql.files.maxPartitionBytes=$$((${MAX_PARTITION_MB} * 1024 * 1024))
+      --conf spark.sql.files.openCostInBytes=$$((${OPEN_COST_MB} * 1024 * 1024))
+      /jobs/read.py"
+
+volumes:
+  minio-data:
+  spark-events:
+  ivy:
