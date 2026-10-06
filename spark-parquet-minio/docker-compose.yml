@@ -1,4 +1,4 @@
-# Không build image nào: chỉ dùng apache/spark + minio/minio + minio/mc.
+# Uses prebuilt images only (see .env); no local builds.
 x-spark-conf: &spark-conf >-
   --conf spark.jars.packages=org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262
   --conf spark.jars.ivy=/ivy
@@ -73,7 +73,7 @@ services:
     depends_on: [spark-master]
     deploy:
       replicas: ${WORKER_REPLICAS}
-    # không publish port: worker UI xem qua master :8080
+    # Worker UI ports are not published (replicas would collide); use the master UI on :8080.
 
   spark-history:
     <<: *spark-base

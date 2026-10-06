@@ -1,35 +1,47 @@
 # spark-parquet-minio
 
-Kiểm tra Spark đọc Parquet trên MinIO (S3A) có song song không. Không build image, chỉ dùng:
-`apache/spark:3.5.3` (master/worker/history/driver), `bitnamilegacy/minio` (MinIO + mc; `minio/minio` không còn trên Docker Hub).
-Jar S3A (`hadoop-aws`, `aws-java-sdk-bundle`) tải qua `spark.jars.packages` vào volume `ivy` (lần đầu ~280MB).
+Measures how Spark reads Parquet from MinIO over S3A and whether the read is parallel.
 
-## Chạy
+Prebuilt images only, nothing is built locally:
+- `apache/spark:3.5.3`: standalone master, workers, history server, and the driver for jobs.
+- `bitnamilegacy/minio`: MinIO server and `mc` (`minio/minio` is no longer published on Docker Hub).
+
+S3A jars (`hadoop-aws:3.3.4`, `aws-java-sdk-bundle:1.12.262`) are resolved at submit time via `spark.jars.packages` into the `ivy` volume (~280 MB on first run, cached afterwards).
+
+## Usage
 ```bash
-make up     # minio + master + workers + history server
-make gen    # dump dữ liệu giả vào s3a://lab/parquet/test
-make read   # đọc N column, in số task / executor / peak concurrent tasks
-make clean  # xoá toàn bộ (kể cả data)
+make up     # MinIO, master, workers, history server
+make gen    # write Parquet to s3a://$BUCKET/$DATA_PATH
+make read   # read N columns, print per-stage parallelism
+make clean  # remove containers and volumes
 ```
-UI: Master http://localhost:8080 · Driver (khi job chạy) http://localhost:4040 · History http://localhost:18080 · MinIO http://localhost:9001 (minioadmin/minioadmin)
 
-Override nhanh: `make read READ_COLUMNS=30 NUM_EXECUTORS=2`, hoặc sửa `.env`. Đổi `WORKER_*`/`WORKER_REPLICAS` cần `make up` lại.
-Muốn xem Spark UI :4040 lâu hơn: `HOLD_SECONDS=120 make read`.
+| UI | URL |
+|----|-----|
+| Spark master | http://localhost:8080 |
+| Driver (only while a job runs) | http://localhost:4040 |
+| History server | http://localhost:18080 |
+| MinIO console | http://localhost:9001 (`minioadmin` / `minioadmin`) |
 
-## Tham số (`.env`)
-| Nhóm | Biến | Ý nghĩa |
+All parameters live in `.env` and can be overridden per run, e.g. `make read READ_COLUMNS=30`. Changing `WORKER_*` requires `make up` again. `HOLD_SECONDS=300 make read` keeps the driver UI up after the query.
+
+## Parameters
+| Group | Variable | Effect |
 |---|---|---|
-| Dump | `TOTAL_COLUMNS` | số column (long/double/string xen kẽ) |
-| | `NUM_FILES`, `ROWS_PER_FILE` | số file và số row/file (quyết định file size) |
-| | `ROW_GROUP_SIZE_MB`, `PAGE_SIZE_KB`, `COMPRESSION` | `parquet.block.size`, `parquet.page.size`, codec |
-| Đọc | `READ_COLUMNS` | chỉ đọc N column đầu (column pruning) |
-| | `MAX_PARTITION_MB`, `OPEN_COST_MB` | `spark.sql.files.maxPartitionBytes/openCostInBytes` – quyết định chia split |
-| Cluster | `WORKER_REPLICAS`, `WORKER_CORES`, `WORKER_MEMORY` | số worker, core/ram mỗi worker |
-| | `NUM_EXECUTORS`, `EXECUTOR_CORES`, `EXECUTOR_MEMORY`, `DRIVER_MEMORY` | executor (standalone: `spark.cores.max = NUM_EXECUTORS*EXECUTOR_CORES`) |
+| Generate | `TOTAL_COLUMNS` | Column count (long/double/string, cycling) |
+| | `NUM_FILES`, `ROWS_PER_FILE` | File count and rows per file; together determine file size |
+| | `ROW_GROUP_SIZE_MB` | `parquet.block.size` |
+| | `PAGE_SIZE_KB`, `COMPRESSION` | `parquet.page.size`, codec |
+| Read | `READ_COLUMNS` | Number of columns selected (column pruning) |
+| | `MAX_PARTITION_MB`, `OPEN_COST_MB` | `spark.sql.files.maxPartitionBytes`, `spark.sql.files.openCostInBytes` |
+| Cluster | `WORKER_REPLICAS`, `WORKER_CORES`, `WORKER_MEMORY` | Worker count and per-worker resources |
+| | `NUM_EXECUTORS`, `EXECUTOR_CORES`, `EXECUTOR_MEMORY`, `DRIVER_MEMORY` | Executor sizing; `spark.cores.max = NUM_EXECUTORS * EXECUTOR_CORES` |
 
-## Đọc kết quả
-`make read` in mỗi stage có đọc input: `tasks`, `executors_used`, `peak_concurrent_tasks`, `input` (byte thực đọc – nhỏ hơn tổng file khi chỉ đọc ít column).
-Song song bị chặn bởi `min(số split, tổng core executor)`. Số split ≈ file/row group/`MAX_PARTITION_MB`.
-Mẫu mặc định (8 file × 100k row × 30 col, đọc 5 col, 4 executor × 2 core): 8 task, 4 executor, peak 8 đồng thời, input 46MB / 356MB.
+## Interpreting output
+`make read` prints, for each stage with input: `tasks`, `executors_used`, `peak_concurrent_tasks`, and `input` (bytes actually read, smaller than the dataset when few columns are selected).
 
-Lưu ý: máy Docker nhỏ (OrbStack 8GB, đĩa gần đầy) đã làm JVM crash SIGBUS; mặc định được giữ nhỏ.
+Read parallelism is bounded by `min(number of input splits, total executor cores)`. Splits are derived from file boundaries and `maxPartitionBytes`; for Parquet, a row group is assigned to the split containing its midpoint, so a single large file with multiple row groups can still be read in parallel.
+
+## Notes
+- Reference run (8 files x 100k rows x 30 columns, 5 columns read, 4 executors x 2 cores): 8 tasks on 4 executors, 8 concurrent, 46 MB read of 356 MB.
+- Docker VM disk exhaustion caused JVM SIGBUS crashes during development; keep free space available for the generated data and the `ivy` volume.

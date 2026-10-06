@@ -1,3 +1,8 @@
+"""Read the dataset and report read parallelism.
+
+After the query, task launch/duration data is pulled from the driver REST API
+(localhost:4040) to compute executors used and peak concurrent tasks per stage.
+"""
 import json, os, time, urllib.request
 from pyspark.sql import SparkSession, functions as F
 
@@ -11,14 +16,14 @@ sc = spark.sparkContext
 df = spark.read.parquet(path)
 total_cols = len(df.columns)
 cols = df.columns[:n]
-q = df.select(*cols).agg(*[F.max(c).alias(c) for c in cols])  # max() buộc đọc thật từng column
+q = df.select(*cols).agg(*[F.max(c).alias(c) for c in cols])  # max() forces each selected column to actually be read
 
 t = time.time()
 sc.setJobDescription(f"read {n}/{total_cols} cols")
 q.collect()
 dt = time.time() - t
 
-# --- phân tích song song từ REST API của driver ---
+# --- parallelism analysis via the driver REST API ---
 api = f"http://localhost:4040/api/v1/applications/{sc.applicationId}"
 get = lambda p: json.load(urllib.request.urlopen(api + p))
 stages = [s for s in get("/stages?details=false") if s["status"] == "COMPLETE" and s["inputBytes"] > 0]

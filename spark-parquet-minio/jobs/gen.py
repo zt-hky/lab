@@ -1,3 +1,8 @@
+"""Generate synthetic Parquet data into MinIO.
+
+Layout is controlled by env vars (see .env): one task writes one file, so
+NUM_FILES * ROWS_PER_FILE rows are spread over NUM_FILES files.
+"""
 import os
 from pyspark.sql import SparkSession, functions as F
 
@@ -7,12 +12,15 @@ path = f"s3a://{e['BUCKET']}/{e['DATA_PATH']}"
 
 spark = SparkSession.builder.appName(f"gen-{cols}cols-{files}files").getOrCreate()
 
-# c0 long, c1 double, c2 string, c3 long ... (random => nén không sụp về 0)
+
 def col(i):
+    # Columns cycle long, double, string. Values derive from rand() so they
+    # do not collapse under dictionary/RLE encoding and keep file size realistic.
     r = F.rand(i)
     return [(r * 1e9).cast("long"), r, F.md5((r * 1e9).cast("string"))][i % 3].alias(f"c{i}")
 
-# range với numPartitions=files -> mỗi partition ghi đúng 1 file
+
+# numPartitions == files => exactly one output file per partition.
 df = spark.range(0, files * rpf, numPartitions=files).select(*[col(i) for i in range(cols)])
 df.write.mode("overwrite").parquet(path)
 
